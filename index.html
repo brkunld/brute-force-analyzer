@@ -194,18 +194,6 @@
             background: linear-gradient(90deg, transparent, var(--accent2), transparent);
         }
 
-        .dict-warning {
-            margin-top: 20px;
-            padding: 14px 18px;
-            background: rgba(255,170,0,0.07);
-            border: 1px solid rgba(255,170,0,0.3);
-            border-radius: 6px;
-            font-size: 0.88rem;
-            color: #ffc;
-            line-height: 1.7;
-        }
-        .dict-warning strong { color: var(--warn); }
-
         @media (max-width: 720px) { .grid { grid-template-columns: 1fr; } }
     </style>
 </head>
@@ -278,85 +266,189 @@
 </div>
 
 <script id="workerCode" type="javascript/worker">
+// Ana iş parçacığından (main thread) postMessage ile bir veri gönderildiğinde bu fonksiyon tetiklenir.
 self.onmessage = function(e) {
+    // Gelen veri paketinden hedef şifreyi (target) ve kullanılacak karakter havuzunu (pool) çıkartıyoruz.
     const { target, pool } = e.data;
-    const len = target.length;
-    const k = pool.length;
+    const len = target.length; // Hedef şifrenin uzunluğu (örn: 4 karakter)
+    const k = pool.length;     // Havuzdaki toplam karakter sayısı (sayı tabanı/matematiksel taban olarak kullanılacak)
+    
+    // Denenebilecek tüm olası kombinasyonların maksimum sayısını (k^len) hesaplıyoruz.
     const totalCombos = Math.pow(k, len);
-    let count = 0;
+    let count = 0; // O ana kadar yapılan deneme sayısını tutacak sayaç
 
-    // İteratif (Base-k) yaklaşım - Performanslı ve güvenli
+    // İteratif (Base-k) yaklaşım - Özyineli (recursive) fonksiyonlara göre çok daha performanslıdır 
+    // ve "Call Stack Size Exceeded" (bellek taşması) hatası vermez.
+    // Şifrenin her bir hanesi için havuzdaki hangi karakterin seçileceğini tutan indeks dizisi.
+    // Başlangıçta tüm haneler havuzun ilk karakterinden (0. indeks) başlar. Örn: 4 haneli için [0, 0, 0, 0]
     let indices = new Array(len).fill(0);
 
+    // Tüm kombinasyonlar tükenene kadar döngüye devam et
+    while (count < totalCombos) {
+        let current = ''; // O döngüde denenecek olan şifre metni
+        
+        // İndeks dizisindeki mevcut değerlere bakarak karakter havuzundan ilgili harfleri yan yana getiriyoruz
+        for (let i = 0; i < len; i++) {
+            current += pool[indices[i]];
+        }
+        count++; // Deneme yapıldığı için sayacı 1 artırıyoruz
+
+        // Eğer oluşturduğumuz şifre (current), kırılmaya çalışılan şifreyle (target) eşleşirse:
+        if (current === target) {
+            // Ana iş parçacığına şifrenin başarıyla bulunduğunu (found), şifreyi ve kaçıncı denemede bulunduğunu ilet
+            self.postMessage({ type: 'found', attempt: current, count });
+            self.close(); // Arka plan işlemini anında sonlandır, CPU'yu boşa çıkar ve kalıntıları temizle
+            return; // Fonksiyonun geri kalanını okumadan çık
+        }
+
+        // Ana arayüzün (UI) çok fazla mesaj trafiğinden dolayı kilitlenmesini veya çökmesini engellemek için,
+        // sadece her 5000 denemede bir ilerleme/durum bilgisi gönderiyoruz.
+        if (count % 5000 === 0) {
+            self.postMessage({ type: 'progress', attempt: current, count });
+        }
+
+        // --- BİR SONRAKİ KOMBİNASYONU OLUŞTURMA MANTIĞI (Sayı sayma algoritması) ---
+        // İndeksleri sağdan sola doğru (birler basamağından başlar gibi) artırıyoruz.
+        for (let i = len - 1; i >= 0; i--) {
+            indices[i]++; // En sağdaki hanenin indeksini 1 artır (havuzdaki bir sonraki harfe geç)
+            
+            // Eğer indeks havuzun boyutunu aşmadıysa (k değerine ulaşmadıysa) elde yok demektir.
+            if (indices[i] < k) {
+                break; // Elde olmadığı için diğer haneleri değiştirmeye gerek yok, for döngüsünü kır ve while'a devam et
+            }
+            
+            // Eğer indeks havuz boyutuna ulaştıysa (k), o hane son karaktere gelmiş demektir.
+            // Bu haneyi sıfırla (başa dön) ve döngü devam edip solundaki haneyi 1 artırsın. (Tıpkı 09'dan 10'a geçerken eldenin sol basamağı artırması gibi)
+            indices[i] = 0; 
+        }
+    }
+
+    // While döngüsü bittiği halde (tüm ihtimaller denendiği halde) şifre bulunamadıysa:
+    // Bu durum sadece, kullanıcının girdiği şifre karakterlerinin seçilen havuzda hiç olmaması durumunda yaşanır.
+    self.postMessage({ type: 'notfound', count });
+    self.close(); // Worker'ı kapatıp kaynakları (belleği) serbest bırak
+};
+</script>
+
+<script>
+// ============================================================================
+// 1. KISIM: WEB WORKER KODU (Arka Planda Çalışan İşlem Parçacığı)
+// Ana tarayıcı arayüzünü dondurmamak (kitlememek) için, yoğun işlem gücü 
+// gerektiren gerçek brute-force işlemi ayrı bir iş parçacığında çalıştırılır.
+// ============================================================================
+
+self.onmessage = function(e) {
+    // Ana iş parçacığından gelen hedef şifreyi ve kullanılacak karakter havuzunu alıyoruz.
+    const { target, pool } = e.data;
+    const len = target.length; // Hedef şifrenin uzunluğu
+    const k = pool.length;     // Havuzdaki karakter sayısı (k tabanı)
+    
+    // Toplam denenebilecek kombinasyon sayısını hesaplıyoruz (k^len)
+    const totalCombos = Math.pow(k, len);
+    let count = 0; // Deneme sayacı
+
+    // İteratif (Base-k) yaklaşımı için bir dizi oluşturuyoruz.
+    // Her bir indeks, şifrenin o hanesindeki karakterin havuzdaki sırasını tutar.
+    // Başlangıçta hepsi 0'dır (örn: 3 haneli şifre için [0, 0, 0])
+    let indices = new Array(len).fill(0);
+
+    // Tüm kombinasyonlar tükenene kadar döngüyü çalıştırıyoruz
     while (count < totalCombos) {
         let current = '';
+        
+        // Mevcut indeks dizisine bakarak o anki denenecek şifre metnini (string) oluşturuyoruz
         for (let i = 0; i < len; i++) {
             current += pool[indices[i]];
         }
         count++;
 
+        // Eğer oluşturduğumuz şifre hedef şifreyle eşleşirse:
         if (current === target) {
+            // Ana iş parçacığına şifrenin bulunduğunu, şifreyi ve kaçıncı denemede bulunduğunu mesaj atıyoruz
             self.postMessage({ type: 'found', attempt: current, count });
-            self.close(); // İşlemi anında sonlandır, stack kalıntılarını temizle
+            self.close(); // Worker'ı kapatıp kaynakları (bellek/işlemci) serbest bırakıyoruz
             return;
         }
 
-        // Terminali boğmamak için belirli aralıklarla bilgi gönder
+        // Arayüzün (terminalin) çok fazla mesajdan ötürü donmaması için her 5000 denemede bir durum güncellemesi gönderiyoruz
         if (count % 5000 === 0) {
             self.postMessage({ type: 'progress', attempt: current, count });
         }
 
-        // Indexleri sağdan sola artır (Sayı sayar gibi)
+        // Bir sonraki kombinasyona geçmek için indeksleri sağdan sola (birler basamağından başlar gibi) artırıyoruz
         for (let i = len - 1; i >= 0; i--) {
-            indices[i]++;
+            indices[i]++; // O hanedeki değeri 1 artır
+            
             if (indices[i] < k) {
-                break; // Elde yoksa döngüden çık
+                // Eğer o hane havuz sınırını aşmadıysa (elde yoksa) işlemi bitir, bir sonraki while dönüşüne geç
+                break; 
             }
-            indices[i] = 0; // K'ya ulaştıysa sıfırla, elde var 1 (Carry)
+            
+            // Eğer o hane havuz sınırına (k) ulaştıysa sıfırla, döngü devam edip solundaki haneyi (elde var 1) artıracak
+            indices[i] = 0; 
         }
     }
 
-    // Döngü bitti ama bulunamadı
+    // Döngü bittiği halde hedef şifre bulunamadıysa (örneğin girilen şifre karakter havuzunda yoksa):
     self.postMessage({ type: 'notfound', count });
-    self.close();
+    self.close(); // Worker'ı sonlandır
 };
-</script>
 
-<script>
-// ─── SABITLER ────────────────────────────────────────────────────
-const SUPER_COMPUTER_SPEED = 100e9;   // 100 Milyar deneme/sn
+// ============================================================================
+// 2. KISIM: ANA UYGULAMA MANTIĞI (MAIN SCRIPT)
+// DOM (Arayüz) etkileşimleri, hesaplamalar ve grafik çizimini yöneten asıl kod
+// ============================================================================
+
+// ─── SABİTLER VE GLOBAL DEĞİŞKENLER ─────────────────────────────────────────
+
+// Karşılaştırma yapmak için kullanılacak süper bilgisayarın saniyedeki deneme hızı (100 Milyar)
+const SUPER_COMPUTER_SPEED = 100e9;   
+// Evrenin yaşının yıl cinsinden yaklaşık değeri (çok uzun süreleri hesaplarken kullanmak için)
 const UNIVERSE_AGE_YEARS   = 13.8e9;
 
+// Kullanılabilecek farklı karakter setleri ve içerikleri (Mod 1'de kullanılıyor)
 const POOLS = {
     "10": "0123456789",
     "26": "abcdefghijklmnopqrstuvwxyz",
     "62": "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 };
 
+// Grafik objesini ve çalışan aktif Web Worker'ı tutacak global değişkenler
 let myChart  = null;
 let currentWorker = null;
 
-// ─── YARDIMCI: Süre Formatla ─────────────────────────────────────
+// ─── YARDIMCI FONKSİYON: Süre Formatlama ────────────────────────────────────
+// Verilen saniye cinsinden süreyi okunabilir bir metne (milisaniye, saniye, yıl vs.) çevirir
 function formatTime(seconds) {
     if (!isFinite(seconds) || seconds <= 0) return "anlık";
     if (seconds < 0.001) return `${(seconds * 1e6).toFixed(1)} mikrosaniye`;
     if (seconds < 1)     return `${(seconds * 1000).toFixed(2)} milisaniye`;
     if (seconds < 60)    return `${seconds.toFixed(2)} saniye`;
+    
     const mins = seconds / 60;
     if (mins < 60)       return `${mins.toFixed(2)} dakika`;
+    
     const hours = mins / 60;
     if (hours < 24)      return `${hours.toFixed(2)} saat`;
+    
     const days = hours / 24;
     if (days < 365.25)   return `${days.toFixed(1)} gün`;
+    
     const years = days / 365.25;
+    // Eğer süre evrenin yaşından küçükse normal yıl formatında göster
     if (years < UNIVERSE_AGE_YEARS)
         return `${years.toLocaleString('tr-TR', {maximumFractionDigits: 0})} yıl`;
+        
+    // Süre evrenin yaşından büyükse kaç katı olduğunu hesapla ve bilimsel (E) gösterim kullan
     const kat = years / UNIVERSE_AGE_YEARS;
     return `<span style="color:var(--danger);font-weight:bold;">${years.toExponential(2)} yıl<br>(Evrenin yaşının ~${kat.toLocaleString('tr-TR',{maximumFractionDigits:0})} katı)</span>`;
 }
 
-// ─── YARDIMCI: Entropi ───────────────────────────────────────────
+// ─── YARDIMCI FONKSİYONLAR: Entropi Hesaplama ───────────────────────────────
+// Şifre güvenliğini belirten bit cinsinden entropiyi hesaplar: E = L * log2(k)
 function entropy(L, k) { return L * Math.log2(k); }
+
+// Hesaplanan entropi değerine (bit) göre güvenlik seviyesi etiketini, rengini ve bar yüzdesini döndürür
 function entropyLabel(bits) {
     if (bits < 28)  return { label: "Çok Zayıf",   color: "#ff4444", pct: Math.min(bits/128*100,100) };
     if (bits < 40)  return { label: "Zayıf",        color: "#ff8800", pct: Math.min(bits/128*100,100) };
@@ -365,28 +457,35 @@ function entropyLabel(bits) {
     return             { label: "Çok Güçlü",        color: "#00e5ff", pct: Math.min(bits/128*100,100) };
 }
 
-// ─── MOD 1: Web Worker ile Gerçek Simülasyon ─────────────────────
+// ─── MOD 1: GERÇEK SİMÜLASYON (Web Worker Tetikleyici) ──────────────────────
+// Kullanıcının girdiği maks 4 haneli şifreyi tarayıcının işlem gücünü kullanarak kırmaya çalışır
 function startRealBruteForce() {
+    // Arayüzden (DOM) ilgili input ve elementleri alıyoruz
     const target = document.getElementById('targetPassword').value;
     const charSetKey = document.getElementById('charSetReal').value;
     const terminal = document.getElementById('terminalLog');
     const btn = document.getElementById('btnMod1');
     const pool = POOLS[charSetKey];
 
+    // Daha önceden çalışan ve bitmemiş bir kırma işlemi varsa onu sonlandır
     if (currentWorker) { currentWorker.terminate(); currentWorker = null; }
 
+    // Hata Kontrolü 1: Şifre alanı boş olamaz
     if (!target) {
         setTerminal(terminal, '<span class="err">> Hata: Lütfen bir şifre girin!</span>');
         return;
     }
+    // Hata Kontrolü 2: Tarayıcının çökmesini engellemek için şifre uzunluğu sınırlandırıldı
     if (target.length > 4) {
         setTerminal(terminal, '<span class="err">> Hata: Tarayıcı sınırı aşıldı. Maks. 4 karakter.</span>');
         return;
     }
 
+    // Hedef şifredeki karakterlerin seçilen havuzda olup olmadığını test et
     let charValid = true;
     for (const ch of target) if (!pool.includes(ch)) { charValid = false; break; }
 
+    // Başlangıç bilgilendirmesini (logları) terminal ekranına yazdır
     let logLines = [
         `> Hedef kilitlendi — uzunluk: ${target.length}, havuz: ${pool.length} karakter`,
         `> Toplam kombinasyon: ${Math.pow(pool.length, target.length).toLocaleString('tr-TR')}`,
@@ -394,74 +493,97 @@ function startRealBruteForce() {
     ];
     setTerminal(terminal, logLines.join('\n'));
 
+    // Eğer şifre havuzun dışındaysa uyar (Örn: Rakam seti seçip harf girilmişse)
     if (!charValid) {
         appendTerminal(terminal, `<span class="err">[!] Şifredeki bazı karakterler seçilen havuzda yok.\n    Süreç tamamlanacak ama şifre bulunamayacak.</span>\n`);
     }
 
+    // Kullanıcının işlemi tekrar başlatmasını engellemek için butonu kilitle
     btn.disabled = true;
     btn.innerText = "⏳ İşleniyor...";
 
-    const startTime = performance.now();
+    const startTime = performance.now(); // Süre ölçümünü başlat (Yüksek hassasiyetli zamanlayıcı)
 
+    // Sayfadaki "workerCode" id'li script içeriğini dinamik olarak bir dosyaya (Blob) dönüştür ve Web Worker yarat
     const blob = new Blob([document.getElementById('workerCode').textContent], {type:'application/javascript'});
     currentWorker = new Worker(URL.createObjectURL(blob));
+    
+    // Worker'a kırma işlemini başlatması için mesaj yolla (hedef ve havuz verisiyle birlikte)
     currentWorker.postMessage({ target, pool });
 
+    // Worker'dan dönen mesajları dinleyen olay yöneticisi (Event Handler)
     currentWorker.onmessage = function(e) {
         const d = e.data;
+        // Eğer gelen mesaj bir ilerleme (progress) durumuyse:
         if (d.type === 'progress') {
             const elapsed = ((performance.now() - startTime)/1000).toFixed(3);
             const lines = terminal.innerHTML.split('\n');
             const progressLine = `<span style="color:var(--muted);">Deneniyor... [<span style="color:var(--accent);">${escapeHtml(d.attempt)}</span>]  (${d.count.toLocaleString('tr-TR')} deneme, ${elapsed}s)</span>`;
+            
+            // Terminal çok hızlı aşağı kaymasın diye, son satırda zaten "Deneniyor..." yazıyorsa sadece o satırı güncelle
             if (lines[lines.length-1].includes('Deneniyor')) {
                 lines[lines.length-1] = progressLine;
                 terminal.innerHTML = lines.join('\n');
-            } else {
+            } else { // Değilse yeni satır olarak ekle
                 appendTerminal(terminal, progressLine + '\n');
             }
-        } else if (d.type === 'found') {
+        } 
+        // Eğer şifre başarıyla bulunduysa:
+        else if (d.type === 'found') {
             const elapsed = ((performance.now() - startTime)/1000).toFixed(3);
             appendTerminal(terminal,
                 `\n<span class="found">[+] ŞİFRE BULUNDU: ${escapeHtml(d.attempt)}</span>\n` +
                 `    Toplam deneme: ${d.count.toLocaleString('tr-TR')}\n` +
                 `    Geçen süre   : ${elapsed} saniye\n`
             );
-            cleanup(btn);
-        } else if (d.type === 'notfound') {
+            cleanup(btn); // Butonu eski haline getir
+        } 
+        // Tüm kombinasyonlar denendiği halde bulunamadıysa:
+        else if (d.type === 'notfound') {
             const elapsed = ((performance.now() - startTime)/1000).toFixed(3);
             appendTerminal(terminal,
                 `\n<span class="err">[-] Şifre bulunamadı (uzay tükendi).</span>\n` +
                 `    Denenen kombinasyon: ${d.count.toLocaleString('tr-TR')}\n` +
                 `    Geçen süre         : ${elapsed} saniye\n`
             );
-            cleanup(btn);
+            cleanup(btn); // Butonu eski haline getir
         }
     };
 }
 
+// Worker işlemini ve Arayüz butonunu sıfırlayan fonksiyon
 function cleanup(btn) {
     btn.disabled = false;
     btn.innerText = "▶ Kırmayı Başlat";
-    currentWorker = null;
+    currentWorker = null; // Bellek sızıntısını önlemek için Worker referansını temizle
 }
+
+// Terminal pencerelerinin HTML içeriğini değiştiren ve kaydırma çubuğunu (scroll) daima en aşağıda tutan fonksiyonlar
 function setTerminal(el, html) { el.innerHTML = html; el.scrollTop = el.scrollHeight; }
 function appendTerminal(el, html) { el.innerHTML += html; el.scrollTop = el.scrollHeight; }
+
+// XSS (Cross-Site Scripting) saldırılarını önlemek için HTML'de çalışan özel karakterleri dönüştürür (Kaçış fonksiyonu)
 function escapeHtml(s) {
     return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
-// ─── MOD 2: Matematiksel Hesaplama ───────────────────────────────
+// ─── MOD 2: MATEMATİKSEL HESAPLAMA VE GRAFİK ÇİZİMİ ─────────────────────────
+
+// Kullanıcı bir "Hazır Hız Profili" seçtiğinde o hızı ilgili input alanına yapıştırır
 function applySpeedPreset() {
     const v = document.getElementById('mathSpeedPreset').value;
     if (v) document.getElementById('mathSpeedVal').value = v;
 }
 
+// Anahtar uzunluğu, karakter seti ve işlem hızına göre süreleri/entropiyi hesaplar
 function calculateMath() {
+    // Form elemanlarındaki değerleri sayı tipine (integer/float) dönüştürerek al
     const L = parseInt(document.getElementById('mathLength').value);
     const k = parseInt(document.getElementById('charSetMath').value);
     const r = parseFloat(document.getElementById('mathSpeedVal').value);
     const resultBox = document.getElementById('mathResult');
 
+    // Negatif, boşluk veya harf girilmesi gibi durumlara karşı basit form doğrulama (Validation)
     if (isNaN(L) || isNaN(r) || L <= 0 || r <= 0) {
         resultBox.style.display = 'block';
         resultBox.className = 'result-box danger';
@@ -469,17 +591,20 @@ function calculateMath() {
         return;
     }
 
-    const N = Math.pow(k, L);
-    const T_max = N / r;           // Kötü senaryo (Maximum süre)
-    const T_avg = T_max / 2;       // Ortalama süre (İstatistiksel beklenti)
-    const E = entropy(L, k);
-    const ei = entropyLabel(E);
+    // Matematiksel ve İstatistiksel Hesaplamalar
+    const N = Math.pow(k, L);      // N = k^L formülüyle Toplam Kombinasyon
+    const T_max = N / r;           // Kötü şans senaryosu (Şifrenin en sonda denenmesi): Toplam Deneme / Hız
+    const T_avg = T_max / 2;       // İstatistiksel ortalama (Şifrenin denemelerin yarısında bulunma ihtimali)
+    const E = entropy(L, k);       // Entropi bit değerini hesapla
+    const ei = entropyLabel(E);    // Entropi bilgisine karşılık gelen etiket ve görsel yüzdelik oranı al
 
+    // Sonucun ne kadar güvenli olduğuna göre HTML kutusunun CSS sınıfını (rengini) belirle
     let boxClass = 'result-box';
-    if (T_avg > 3.15e7)  boxClass = 'result-box warn';    // > 1 yıl
-    if (T_avg > 3.15e9)  boxClass = 'result-box danger';  // > 100 yıl
-    if (E < 40)          boxClass = 'result-box danger';
+    if (T_avg > 3.15e7)  boxClass = 'result-box warn';    // 1 yıldan uzun sürüyorsa sarı (Uyarı)
+    if (T_avg > 3.15e9)  boxClass = 'result-box danger';  // 100 yıldan uzun sürüyorsa kırmızı arkaplan (Fakat şifre bağlamında tehlikeli anlamına gelmez, burada kırma işleminin umutsuzluğu/tehlikesi kastedilmiş)
+    if (E < 40)          boxClass = 'result-box danger';  // Entropi 40 bitten küçükse (Güvensiz şifre) kırmızı
 
+    // Hesaplanan değerleri UI (Arayüz) üzerinde kullanıcıya göstermek için div içine yazdır
     resultBox.style.display = 'block';
     resultBox.className = boxClass;
     resultBox.innerHTML = `
@@ -503,34 +628,45 @@ function calculateMath() {
         </div>
     `;
 
+    // Yeni hesaplanan verilere göre grafiği yeniden çizdir
     drawChart(k, r, L);
 }
 
-// ─── GRAFİK ──────────────────────────────────────────────────────
+// ─── GRAFİK ÇİZİM FONKSİYONU (Chart.js Kütüphanesi Kullanılarak) ────────────
+// X eksenine karakter uzunluğunu (L), Y eksenine ise kırılma süresini (logaritmik) yerleştirir
 function drawChart(k, userSpeed, currentL) {
     const ctx = document.getElementById('bruteChart').getContext('2d');
+    
+    // Grafiğin X ekseni genişliğini dinamik olarak belirle. Seçili uzunluktan 4 birim fazla çiz.
+    // Çok kısa şifrelerde grafiğin çok dar olmaması için de minimum 14 olsun.
     const maxLen = Math.max(currentL + 4, 14);
 
     const labels = [];
     const dataUser = [], dataSuperComp = [];
 
+    // Veri noktalarını (Data Points) doldurmak için 1 karakterden maxLen karakter sınırına kadar döngü kur
     for (let i = 1; i <= maxLen; i++) {
-        labels.push(`${i}`);
+        labels.push(`${i}`); // X ekseni etiketleri (Uzunluk)
+        
         const N = Math.pow(k, i);
-        // Grafikte ortalama süreyi (N / 2 / hız) baz alıyoruz
+        // İstatistiksel olarak (N/2) formülünü kullanarak Ortalama süreyi baz alıyoruz
+        // Logaritmik grafikte veri noktasının hiçbir zaman tamamen 0 olup hesap hatasına düşmemesi için
+        // asgari değeri (Math.max) 1 mikrosaniye (1e-6) olarak ayarlıyoruz
         dataUser.push(Math.max((N / 2) / userSpeed, 1e-6));
         dataSuperComp.push(Math.max((N / 2) / SUPER_COMPUTER_SPEED, 1e-6));
     }
 
+    // HTML Canvas üzerindeki eski grafik objesini hafızadan sil (destroy). Yoksa grafikler üst üste biner.
     if (myChart) myChart.destroy();
 
+    // Yeni grafik konfigürasyonunu tanımla
     myChart = new Chart(ctx, {
-        type: 'line',
+        type: 'line', // Çizgi grafik
         data: {
             labels,
             datasets: [
                 {
-                    label: `Seçilen Hız (Ort. Süre)`,
+                    label: `Seçilen Hız (Ort. Süre)`, // Kullanıcının girdiği hız verisi (Mavi çizgi)
                     data: dataUser,
                     borderColor: '#00e5ff',
                     backgroundColor: 'rgba(0,229,255,0.08)',
@@ -538,13 +674,13 @@ function drawChart(k, userSpeed, currentL) {
                     pointRadius: 3,
                     pointBackgroundColor: '#00e5ff',
                     fill: true,
-                    tension: 0.3
+                    tension: 0.3 // Eğrilerin uç noktalarını köşeli değil, yumuşak birleştir
                 },
                 {
-                    label: `Süper Bilgisayar (Ort. Süre)`,
+                    label: `Süper Bilgisayar (Ort. Süre)`, // Kırmızı, kesikli referans çizgisi
                     data: dataSuperComp,
                     borderColor: '#ff4444',
-                    borderDash: [6, 4],
+                    borderDash: [6, 4], // Çizgiyi kesik kesik yap (6px dolu, 4px boşluk)
                     borderWidth: 2,
                     pointRadius: 0,
                     fill: false,
@@ -553,29 +689,32 @@ function drawChart(k, userSpeed, currentL) {
             ]
         },
         options: {
-            responsive: true,
+            responsive: true, // Ekran boyutuna göre kendini şekillendirsin
             plugins: {
                 legend: { labels: { color: '#cfe8ff', font: { family: "'Rajdhani', sans-serif", size: 13 } } },
                 tooltip: {
                     callbacks: {
+                        // İmleçle veri noktasının üzerine gelindiğinde çıkan kutudaki (Tooltip) veriyi formatla
                         label: ctx => {
                             const s = ctx.dataset.label.split(' ')[0];
+                            // formatTime() fonksiyonu içindeki HTML span etiketlerini Regex (/<[^>]*>/g) ile sil
                             return `  ${s}: ${formatTime(ctx.raw).replace(/<[^>]*>/g, '')}`;
                         }
                     }
                 }
             },
             scales: {
-                x: {
+                x: { // Yatay (X) Eksen ayarları
                     ticks: { color: '#4a7090' },
                     grid: { color: '#1e3048' },
                     title: { display: true, text: 'Karakter Uzunluğu', color: '#cfe8ff' }
                 },
-                y: {
-                    type: 'logarithmic',
+                y: { // Dikey (Y) Eksen ayarları
+                    type: 'logarithmic', // Değerler saniyelerden birden milyarlarca yıla sıçradığı için doğrusal (linear) yerine logaritmik eksen kullanıldı
                     min: 1e-6,
                     ticks: {
                         color: '#4a7090',
+                        // Y ekseninin sol tarafındaki etiket yazılarını okunabilir sürelere çevir ve HTML etiketlerini sil
                         callback: val => formatTime(val).replace(/<[^>]*>/g, '')
                     },
                     grid: { color: '#1e3048' },
@@ -586,7 +725,8 @@ function drawChart(k, userSpeed, currentL) {
     });
 }
 
-// İlk yükleme
+// Javascript dosyası (veya sayfa) tamamen yüklendiğinde grafiği varsayılan ayarlar olan: 
+// 95 Karakterli (Tüm ASCII seti), Saniyede 1 Milyon Deneme Hızı ve 12 Karakter Uzunluğu ile ekrana çiz.
 window.onload = () => drawChart(95, 1000000, 12);
 </script>
 </body>
